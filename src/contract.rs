@@ -6,7 +6,7 @@ use cosmwasm_std::{
 use secret_toolkit::snip20;
 use crate::msg::{
     ExecuteMsg, InstantiateMsg, QueryMsg, QueryStateResponse, QuerySwapResponse,
-    ReceiveMsg, UnclaimedDepositResponse, StakingInstantiateMsg,
+    ReceiveMsg, UnclaimedDepositResponse, StakingInstantiateMsg, MigrateMsg,
     Snip20InstantiateMsg, InitConfig, SendMessage,
 };
 use crate::state::{STATE, State, DEPOSITS};
@@ -14,7 +14,7 @@ use crate::state::{STATE, State, DEPOSITS};
 const INSTANTIATE_LP_TOKEN_REPLY_ID: u64 = 0;
 const INSTANTIATE_LP_STAKING_REPLY_ID: u64 = 1;
 const ERTH_DAO: &str = "secret1hxrvx0v0zvqgmpuzspdg5j8rrxpjgyjql3w9gh";
-const CONTRACT_VERSION: &str = "v0.0.18";
+const CONTRACT_VERSION: &str = "v0.0.20";
 
 #[entry_point]
 pub fn instantiate(
@@ -346,8 +346,6 @@ fn receive_swap(
         return Err(StdError::generic_err("Invalid input token"));
     };
 
-    // Save state after the main swap
-    STATE.save(deps.storage, &state)?;
 
     let mut messages = vec![];
 
@@ -361,10 +359,7 @@ fn receive_swap(
         state.token_b_reserve += protocol_fee_in_b;
         state.token_erth_reserve -= protocol_fee_converted_to_erth;
 
-        // Save the updated state after the protocol fee swap
-        STATE.save(deps.storage, &state)?;
 
-        // Create a message to send the swapped ERTH to the buyback contract
         let buyback_msg = snip20::HandleMsg::Send {
             recipient: state.burn_contract.to_string(),
             recipient_code_hash: Some(state.burn_hash.clone()),
@@ -379,10 +374,11 @@ fn receive_swap(
             msg: to_binary(&buyback_msg)?,
             funds: vec![],
         }));
+
     } else if input_token == state.token_erth_contract && protocol_fee_amount > Uint128::zero() {
         // If the protocol fee is in ERTH, send it directly to the buyback contract
         let buyback_msg = snip20::HandleMsg::Send {
-            recipient: state.burn_contract.clone().to_string(),
+            recipient: state.burn_contract.to_string(),
             recipient_code_hash: Some(state.burn_hash.clone()),
             amount: protocol_fee_amount,
             msg: Some(to_binary(&SendMessage::BurnErth {})?),
@@ -396,9 +392,8 @@ fn receive_swap(
             funds: vec![],
         }));
 
-        // Save state after the protocol fee is processed
-        STATE.save(deps.storage, &state)?;
     }
+    STATE.save(deps.storage, &state)?;
 
     // Unwrap the transfer message and add it to the messages vector
     if let Some(msg) = transfer_message {
@@ -501,20 +496,16 @@ fn receive_erth_buyback_swap(
     if from != state.burn_contract {
         return Err(StdError::generic_err("Unauthorized: Only the buyback contract can initiate a buyback swap."));
     }
-    if input_token == state.token_erth_contract {
+    if input_token != state.token_b_contract {
         return Err(StdError::generic_err("invalid input token for erth buyback contract"));
     }
 
     // Calculate the swap details without fees
     let (input_amount, output_amount) = calculate_feeless_swap(&state, amount, &input_token)?;
 
-    // Update reserves based on the input token type
-    if input_token == state.token_b_contract {
-        state.token_b_reserve += input_amount;
-        state.token_erth_reserve -= output_amount;
-    } else {
-        return Err(StdError::generic_err("Invalid input token"));
-    }
+    state.token_b_reserve += input_amount;
+    state.token_erth_reserve -= output_amount;
+
 
     // Save state
     STATE.save(deps.storage, &state)?;
@@ -560,20 +551,16 @@ fn receive_anml_buyback_swap(
     if from != state.registration_contract {
         return Err(StdError::generic_err("Unauthorized: Only the registration contract can initiate a buyback swap."));
     }
-    if input_token == state.token_b_contract {
+    if input_token != state.token_erth_contract {
         return Err(StdError::generic_err("invalid input token for anml buyback contract"));
     }
 
     // Calculate the swap details without fees
     let (input_amount, output_amount) = calculate_feeless_swap(&state, amount, &input_token)?;
 
-    // Update reserves based on the input token type
-    if input_token == state.token_b_contract {
-        state.token_b_reserve += input_amount;
-        state.token_erth_reserve -= output_amount;
-    } else {
-        return Err(StdError::generic_err("Invalid input token"));
-    }
+    state.token_erth_reserve += input_amount;
+    state.token_b_reserve -= output_amount;
+
 
     // Save state
     STATE.save(deps.storage, &state)?;
@@ -581,7 +568,7 @@ fn receive_anml_buyback_swap(
     // Create a Send message to send the output amount back to the buyback contract for burning
     let buyback_msg = snip20::HandleMsg::Send {
         recipient: state.burn_contract.to_string(),
-        recipient_code_hash: Some(state.burn_contract.to_string().clone()),
+        recipient_code_hash: Some(state.burn_hash.to_string().clone()),
         amount: output_amount,
         msg: Some(to_binary(&SendMessage::BurnAnml {})?),
         memo: None,
@@ -590,8 +577,8 @@ fn receive_anml_buyback_swap(
 
     // Create the message to execute the Send
     let send_message = CosmosMsg::Wasm(WasmMsg::Execute {
-        contract_addr: state.token_erth_contract.to_string(),
-        code_hash: state.token_erth_hash.clone(),
+        contract_addr: state.token_b_contract.to_string(),
+        code_hash: state.token_b_hash.clone(),
         msg: to_binary(&buyback_msg)?,
         funds: vec![],
     });
@@ -866,6 +853,18 @@ fn handle_instantiate_lp_staking_reply(
         .add_attribute("action", "instantiate_lp_staking")
         .add_attribute("lp_staking_contract", lp_staking_contract_addr.to_string()))
 }
+
+#[entry_point]
+pub fn migrate(_deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
+    match msg {
+        MigrateMsg::Migrate {} => {
+
+            Ok(Response::new()
+                .add_attribute("action", "migrate"))
+        }
+    }
+}
+
 
 #[entry_point]
 pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
