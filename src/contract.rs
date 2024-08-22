@@ -6,13 +6,12 @@ use cosmwasm_std::{
 use secret_toolkit::snip20;
 use crate::msg::{
     ExecuteMsg, InstantiateMsg, QueryMsg, QueryStateResponse, QuerySwapResponse,
-    ReceiveMsg, UnclaimedDepositResponse, StakingInstantiateMsg, MigrateMsg,
+    ReceiveMsg, UnclaimedDepositResponse, MigrateMsg,
     Snip20InstantiateMsg, InitConfig, SendMessage,
 };
-use crate::state::{STATE, State, DEPOSITS};
+use crate::state::{STATE, State, DEPOSITS, OLD_STATE};
 
 const INSTANTIATE_LP_TOKEN_REPLY_ID: u64 = 0;
-const INSTANTIATE_LP_STAKING_REPLY_ID: u64 = 1;
 const ERTH_DAO: &str = "secret1hxrvx0v0zvqgmpuzspdg5j8rrxpjgyjql3w9gh";
 const CONTRACT_VERSION: &str = "v0.0.20";
 
@@ -27,8 +26,8 @@ pub fn instantiate(
     let contract_manager = deps.api.addr_validate(&msg.contract_manager)?;
     let token_erth_contract = deps.api.addr_validate(&msg.token_erth_contract)?;
     let token_b_contract = deps.api.addr_validate(&msg.token_b_contract)?;
-    let burn_contract_addr = deps.api.addr_validate(&msg.burn_contract)?;
     let registration_contract_addr = deps.api.addr_validate(&msg.registration_contract)?;
+    let lp_staking_contract_addr = deps.api.addr_validate(&msg.lp_staking_contract)?;
 
 
     let lp_token_name = format!("ERTH-{} Animal Swap LP Token", msg.token_b_symbol);
@@ -77,16 +76,13 @@ pub fn instantiate(
         token_b_contract: token_b_contract.clone(),
         token_b_hash: msg.token_b_hash.clone(),
         token_b_symbol: msg.token_b_symbol,
-        burn_contract: burn_contract_addr.clone(),
-        burn_hash: msg.burn_hash,
         registration_contract: registration_contract_addr.clone(),
         registration_hash: msg.registration_hash,
         lp_token_contract: Addr::unchecked(""), // Placeholder
         lp_token_hash: msg.lp_token_hash.clone(),
         lp_token_code_id: msg.lp_token_code_id,
-        lp_staking_contract: Addr::unchecked(""), // Placeholder
+        lp_staking_contract: lp_staking_contract_addr, // Placeholder
         lp_staking_hash: msg.lp_staking_hash.clone(),
-        lp_staking_code_id: msg.lp_staking_code_id,
         token_erth_reserve: Uint128::zero(),
         token_b_reserve: Uint128::zero(),
         total_shares: Uint128::zero(),
@@ -261,12 +257,6 @@ pub fn execute_update_state(
         "token_b_hash" => {
             state.token_b_hash = value.clone();
         }
-        "burn_contract" => {
-            state.burn_contract = deps.api.addr_validate(&value)?;
-        }
-        "burn_hash" => {
-            state.burn_hash = value.clone();
-        }
         "lp_token_hash" => {
             state.lp_token_hash = value.clone();
         }
@@ -361,8 +351,8 @@ fn receive_swap(
 
 
         let buyback_msg = snip20::HandleMsg::Send {
-            recipient: state.burn_contract.to_string(),
-            recipient_code_hash: Some(state.burn_hash.clone()),
+            recipient: state.lp_staking_contract.to_string(),
+            recipient_code_hash: Some(state.lp_staking_hash.clone()),
             amount: protocol_fee_converted_to_erth,
             msg: Some(to_binary(&SendMessage::BurnErth {})?),
             memo: None,
@@ -378,8 +368,8 @@ fn receive_swap(
     } else if input_token == state.token_erth_contract && protocol_fee_amount > Uint128::zero() {
         // If the protocol fee is in ERTH, send it directly to the buyback contract
         let buyback_msg = snip20::HandleMsg::Send {
-            recipient: state.burn_contract.to_string(),
-            recipient_code_hash: Some(state.burn_hash.clone()),
+            recipient: state.lp_staking_contract.to_string(),
+            recipient_code_hash: Some(state.lp_staking_hash.clone()),
             amount: protocol_fee_amount,
             msg: Some(to_binary(&SendMessage::BurnErth {})?),
             memo: None,
@@ -493,7 +483,7 @@ fn receive_erth_buyback_swap(
 
 
     // Ensure the call is coming from the buyback contract and input token isn't ERTH
-    if from != state.burn_contract {
+    if from != state.lp_staking_contract {
         return Err(StdError::generic_err("Unauthorized: Only the buyback contract can initiate a buyback swap."));
     }
     if input_token != state.token_b_contract {
@@ -512,8 +502,8 @@ fn receive_erth_buyback_swap(
 
     // Create a Send message to send the output amount back to the buyback contract for burning
     let buyback_msg = snip20::HandleMsg::Send {
-        recipient: state.burn_contract.to_string(),
-        recipient_code_hash: Some(state.burn_contract.clone().to_string()),
+        recipient: state.lp_staking_contract.to_string(),
+        recipient_code_hash: Some(state.lp_staking_hash.clone()),
         amount: output_amount,
         msg: Some(to_binary(&SendMessage::BurnErth {})?),
         memo: None,
@@ -567,8 +557,8 @@ fn receive_anml_buyback_swap(
 
     // Create a Send message to send the output amount back to the buyback contract for burning
     let buyback_msg = snip20::HandleMsg::Send {
-        recipient: state.burn_contract.to_string(),
-        recipient_code_hash: Some(state.burn_hash.to_string().clone()),
+        recipient: state.lp_staking_contract.to_string(),
+        recipient_code_hash: Some(state.lp_staking_hash.clone()),
         amount: output_amount,
         msg: Some(to_binary(&SendMessage::BurnAnml {})?),
         memo: None,
@@ -699,7 +689,6 @@ pub fn recieve_unbond_liquidity(
 pub fn reply(deps: DepsMut, env: Env, msg: Reply) -> StdResult<Response> {
     match msg.id {
         INSTANTIATE_LP_TOKEN_REPLY_ID => handle_instantiate_lp_token_reply(deps, env, msg),
-        INSTANTIATE_LP_STAKING_REPLY_ID => handle_instantiate_lp_staking_reply(deps, env, msg),
         _ => Err(StdError::generic_err("Unknown reply ID")),
     }
 }
@@ -778,92 +767,54 @@ fn handle_instantiate_lp_token_reply(
         funds: vec![],
     });
 
-    // Create the instantiation message for the staking contract
-    let staking_instantiate_msg = StakingInstantiateMsg {
-        lp_token_contract: lp_token_contract_addr.clone().to_string(),
-        lp_token_hash: state.lp_token_hash.clone(),
-        erth_contract: state.token_erth_contract.clone().to_string(),
-        erth_hash: state.token_erth_hash.clone(),
-    };
-
-    let staking_msg = WasmMsg::Instantiate {
-        admin: Some(ERTH_DAO.to_string()), // Use hardcoded ERTH_DAO address
-        code_id: state.lp_staking_code_id, // This should be the code ID of the staking contract on the blockchain
-        code_hash: state.lp_staking_hash.clone(),
-        msg: to_binary(&staking_instantiate_msg)?,
-        funds: vec![],
-        label: format!("ERTH-{} LP Staking {}", state.token_b_symbol, CONTRACT_VERSION),
-    };
-
-    // Submessage for staking contract instantiation
-    let sub_msg_staking = SubMsg::reply_on_success(CosmosMsg::Wasm(staking_msg), INSTANTIATE_LP_STAKING_REPLY_ID);
 
     Ok(Response::new()
         .add_message(register_lp_msg) // Add the registration message for the LP token
         .add_message(register_erth_msg)
         .add_message(register_b_msg)
-        .add_submessage(sub_msg_staking)
         .add_attribute("action", "instantiate_lp_token")
         .add_attribute("lp_token_contract", lp_token_contract_addr.to_string()))
 }
 
 
-fn handle_instantiate_lp_staking_reply(
-    deps: DepsMut,
-    _env: Env,
-    msg: Reply,
-) -> StdResult<Response> {
-    let mut state = STATE.load(deps.storage)?;
-
-    // Extract the SubMsgExecutionResponse from the reply
-    let res: SubMsgResponse = msg.result.unwrap();
-
-    // Find the event that contains the contract address
-    let contract_address_event = res
-        .events
-        .iter()
-        .find(|event| event.ty == "instantiate");
-
-    // Ensure we found the instantiate event
-    let contract_address_event = match contract_address_event {
-        Some(event) => event,
-        None => return Err(StdError::generic_err("Failed to find instantiate event")),
-    };
-
-    // Find the attribute that contains the contract address
-    let contract_address_attr = contract_address_event
-        .attributes
-        .iter()
-        .find(|attr| attr.key == "contract_address");
-
-    // Ensure we found the contract address attribute
-    let contract_address = match contract_address_attr {
-        Some(attr) => &attr.value,
-        None => return Err(StdError::generic_err("Failed to find contract address")),
-    };
-
-    // Validate the contract address
-    let lp_staking_contract_addr = deps.api.addr_validate(contract_address)?;
-
-    // Update the state with the LP staking contract address
-    state.lp_staking_contract = lp_staking_contract_addr.clone();
-    STATE.save(deps.storage, &state)?;
-
-    Ok(Response::new()
-        .add_attribute("action", "instantiate_lp_staking")
-        .add_attribute("lp_staking_contract", lp_staking_contract_addr.to_string()))
-}
 
 #[entry_point]
-pub fn migrate(_deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
+pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
         MigrateMsg::Migrate {} => {
+            // Load the old state
+            let old_state = OLD_STATE.load(deps.storage)?;
+
+            // Map old state to new state
+            let new_state = State {
+                contract_manager: old_state.contract_manager,
+                token_erth_contract: old_state.token_erth_contract,
+                token_erth_hash: old_state.token_erth_hash,
+                token_b_contract: old_state.token_b_contract,
+                token_b_hash: old_state.token_b_hash,
+                token_b_symbol: old_state.token_b_symbol,
+                registration_contract: old_state.registration_contract,
+                registration_hash: old_state.registration_hash,
+                lp_token_contract: old_state.lp_token_contract,
+                lp_token_hash: old_state.lp_token_hash,
+                lp_token_code_id: old_state.lp_token_code_id,
+                lp_staking_contract: old_state.burn_contract,
+                lp_staking_hash: old_state.burn_hash,
+                token_erth_reserve: old_state.token_erth_reserve,
+                token_b_reserve: old_state.token_b_reserve,
+                total_shares: old_state.total_shares,
+                protocol_fee: old_state.protocol_fee,
+            };
+
+            // Save the new state
+            STATE.save(deps.storage, &new_state)?;
 
             Ok(Response::new()
                 .add_attribute("action", "migrate"))
         }
     }
 }
+
 
 
 #[entry_point]

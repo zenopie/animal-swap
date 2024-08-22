@@ -12,16 +12,14 @@ pub struct InstantiateMsg {
     pub token_erth_hash: String,
     pub token_b_contract: String,
     pub token_b_hash: String,
-    pub burn_contract: String,
-    pub burn_hash: String,
     pub registration_contract: String,
     pub registration_hash: String,
     pub token_b_symbol: String,
     pub lp_token_decimals: u8,
     pub lp_token_hash: String,
     pub lp_token_code_id: u64,
+    pub lp_staking_contract: String,
     pub lp_staking_hash: String,
-    pub lp_staking_code_id: u64,
     pub protocol_fee: Uint128,
 }
 
@@ -51,14 +49,6 @@ pub struct InitConfig {
     pub enable_mint: Option<bool>,
     pub enable_burn: Option<bool>,
     pub can_modify_denoms: Option<bool>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
-pub struct StakingInstantiateMsg {
-    pub lp_token_contract: String,
-    pub lp_token_hash: String,
-    pub erth_contract: String,
-    pub erth_hash: String,
 }
 
 
