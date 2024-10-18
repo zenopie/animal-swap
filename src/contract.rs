@@ -6,14 +6,14 @@ use cosmwasm_std::{
 use secret_toolkit::snip20;
 use crate::msg::{
     ExecuteMsg, InstantiateMsg, QueryMsg, QueryStateResponse, QuerySwapResponse,
-    ReceiveMsg, UnclaimedDepositResponse, MigrateMsg,
+    ReceiveMsg, UnclaimedDepositResponse, MigrateMsg, HopDetails,
     Snip20InstantiateMsg, InitConfig, SendMessage,
 };
-use crate::state::{STATE, State, DEPOSITS, OLD_STATE};
+use crate::state::{STATE, State, DEPOSITS};
 
 const INSTANTIATE_LP_TOKEN_REPLY_ID: u64 = 0;
 const ERTH_DAO: &str = "secret1hxrvx0v0zvqgmpuzspdg5j8rrxpjgyjql3w9gh";
-const CONTRACT_VERSION: &str = "v0.0.20";
+const CONTRACT_VERSION: &str = "v0.0.22";
 
 #[entry_point]
 pub fn instantiate(
@@ -179,7 +179,7 @@ pub fn execute_add_liquidity(
     }));
 
     // Refund the excess token if any
-    if excess_amount > Uint128::zero() {
+    if excess_amount > Uint128::from(2u32) {
         let refund_msg = snip20::HandleMsg::Transfer {
             recipient: info.sender.clone().to_string(),
             amount: excess_amount,
@@ -300,95 +300,112 @@ pub fn execute_receive(
     let from_addr = deps.api.addr_validate(&from)?;
 
     match msg {
-        ReceiveMsg::Swap { min_received } => receive_swap(deps, env, info, from_addr, amount, min_received),
+        ReceiveMsg::Swap {min_received, hop, user} => receive_swap(deps, env, info, from_addr, amount, min_received, hop, user),
         ReceiveMsg::UnbondLiquidity {} => recieve_unbond_liquidity(deps, env, info, from_addr, amount),
-        ReceiveMsg::ErthBuybackSwap {} => receive_erth_buyback_swap(deps, env, info, from_addr, amount),
-        ReceiveMsg::AnmlBuybackSwap {} => receive_anml_buyback_swap(deps, env, info, from_addr, amount),
+        ReceiveMsg::ErthBuybackSwap {} => receive_erth_buyback_swap(deps, info, amount),
+        ReceiveMsg::AnmlBuybackSwap {} => receive_anml_buyback_swap(deps, info, amount),
 
     }
 }
+
+
 
 fn receive_swap(
     deps: DepsMut,
     _env: Env,
     info: MessageInfo,
-    from: Addr,
+    mut from: Addr,
     amount: Uint128,
     min_received: Option<Uint128>,
+    hop: Option<HopDetails>,
+    user: Option<Addr>,
 ) -> Result<Response, StdError> {
     // Load state
     let mut state = STATE.load(deps.storage)?;
     let input_amount = amount;
     let input_token = info.sender.clone();
 
-    // Calculate the swap details for the main swap
-    let (protocol_fee_amount, output_amount, transfer_message) =
-        calculate_swap(&state, Some(from.clone()), input_amount, &input_token, min_received)?;
-
-    // Update reserves based on the input token type and determine the contract details
-    if input_token == state.token_erth_contract {
-        state.token_erth_reserve += input_amount - protocol_fee_amount;
-        state.token_b_reserve -= output_amount;
-    } else if input_token == state.token_b_contract {
-        state.token_b_reserve += input_amount - protocol_fee_amount;
-        state.token_erth_reserve -= output_amount;
-    } else {
-        return Err(StdError::generic_err("Invalid input token"));
-    };
-
+    // Calculate the swap details and update reserves directly, including trade volume in ERTH
+    let (protocol_fee_amount, output_amount, output_addr, output_hash, trade_volume_in_erth) =
+        calculate_swap(&mut state, input_amount, &input_token)?;
 
     let mut messages = vec![];
 
-    // Handle protocol fee in B tokens
-    if input_token == state.token_b_contract && protocol_fee_amount > Uint128::zero() {
-        // Perform a feeless swap of the protocol fee from B to ERTH
-        let (protocol_fee_in_b, protocol_fee_converted_to_erth) =
-            calculate_feeless_swap(&state, protocol_fee_amount, &state.token_b_contract)?;
+    // Handle the protocol fee in ERTH
+    let buyback_msg = snip20::HandleMsg::Send {
+        recipient: state.lp_staking_contract.to_string(),
+        recipient_code_hash: Some(state.lp_staking_hash.clone()),
+        amount: protocol_fee_amount,
+        msg: Some(to_binary(&SendMessage::BurnErth {
+            trade_volume: trade_volume_in_erth, 
+            pool_liquidity: state.token_erth_reserve * Uint128::from(2u32),
+            total_shares: state.total_shares.clone(),
+        })?),
+        memo: None,
+        padding: None,
+    };
 
-        // Update reserves based on the protocol fee swap
-        state.token_b_reserve += protocol_fee_in_b;
-        state.token_erth_reserve -= protocol_fee_converted_to_erth;
+    messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+        contract_addr: state.token_erth_contract.to_string(),
+        code_hash: state.token_erth_hash.clone(),
+        msg: to_binary(&buyback_msg)?,
+        funds: vec![],
+    }));
 
+    // Check if hop details are provided
+    if let Some(hop_details) = hop {
+        // Try to validate the hop contract address
+        let hop_addr = deps.api.addr_validate(&hop_details.contract)?;
 
-        let buyback_msg = snip20::HandleMsg::Send {
-            recipient: state.lp_staking_contract.to_string(),
-            recipient_code_hash: Some(state.lp_staking_hash.clone()),
-            amount: protocol_fee_converted_to_erth,
-            msg: Some(to_binary(&SendMessage::BurnErth {})?),
+        let hop_msg = snip20::HandleMsg::Send {
+            recipient: hop_addr.to_string(),
+            recipient_code_hash: Some(hop_details.hash.clone()),
+            amount: output_amount,
+            msg: Some(to_binary(&SendMessage::Swap {
+                min_received: min_received.clone(),
+                user: from.clone(),
+            })?),
             memo: None,
             padding: None,
         };
+
         messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
-            contract_addr: state.token_erth_contract.to_string(),
-            code_hash: state.token_erth_hash.clone(),
-            msg: to_binary(&buyback_msg)?,
+            contract_addr: output_addr.to_string(),
+            code_hash: output_hash.clone(),
+            msg: to_binary(&hop_msg)?,
             funds: vec![],
         }));
 
-    } else if input_token == state.token_erth_contract && protocol_fee_amount > Uint128::zero() {
-        // If the protocol fee is in ERTH, send it directly to the buyback contract
-        let buyback_msg = snip20::HandleMsg::Send {
-            recipient: state.lp_staking_contract.to_string(),
-            recipient_code_hash: Some(state.lp_staking_hash.clone()),
-            amount: protocol_fee_amount,
-            msg: Some(to_binary(&SendMessage::BurnErth {})?),
-            memo: None,
-            padding: None,
-        };
+    } else {
+        // Check against minimum received amount
+        if let Some(min) = min_received {
+            if output_amount < min {
+                return Err(StdError::generic_err("Output amount is less than the minimum received amount"));
+            }
+        }
+
+        // Check for user parameter in the case of the second part of the hop
+        if let Some(user_addr) = user {
+            from = user_addr;
+        }
+        
+
+        // Create transfer message if `from` is provided
         messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
-            contract_addr: state.token_erth_contract.to_string(),
-            code_hash: state.token_erth_hash.clone(),
-            msg: to_binary(&buyback_msg)?,
+            contract_addr: output_addr.to_string(),
+            code_hash: output_hash,
+            msg: to_binary(&snip20::HandleMsg::Transfer {
+                recipient: from.to_string(),
+                amount: output_amount,
+                padding: None,
+                memo: None,
+            })?,
             funds: vec![],
         }));
-
     }
+
+    // Save the updated state
     STATE.save(deps.storage, &state)?;
-
-    // Unwrap the transfer message and add it to the messages vector
-    if let Some(msg) = transfer_message {
-        messages.push(msg);
-    }
 
     Ok(Response::new()
         .add_messages(messages)
@@ -396,31 +413,29 @@ fn receive_swap(
         .add_attribute("from", from.to_string())
         .add_attribute("input_amount", amount.to_string())
         .add_attribute("output_amount", output_amount.to_string())
-        .add_attribute("protocol_fee_amount", protocol_fee_amount.to_string()))
+        .add_attribute("protocol_fee_amount", protocol_fee_amount.to_string())
+        .add_attribute("trade_volume_in_erth", trade_volume_in_erth.to_string()))  // Add trade volume attribute
 }
 
 
 
-
-
 fn calculate_swap(
-    state: &State,
-    from: Option<Addr>,
+    state: &mut State,  // Mutably borrow the state so we can update reserves
     input_amount: Uint128,
     input_token: &Addr,
-    min_received: Option<Uint128>,
-) -> Result<(Uint128, Uint128, Option<CosmosMsg>), StdError> {
-    // Calculate fees
-    let protocol_fee_amount = input_amount * state.protocol_fee / Uint128::from(10000u128);
+) -> Result<(Uint128, Uint128, Addr, String, Uint128), StdError> {
+    // Calculate protocol fee in the input token
+    let mut protocol_fee_amount = input_amount * state.protocol_fee / Uint128::from(10000u128);
     let amount_after_protocol_fee = input_amount - protocol_fee_amount;
 
-    // Determine reserves, contract address, and code hash
-    let (input_reserve, output_reserve, contract_addr, code_hash) = if input_token == &state.token_erth_contract {
+    // Extract all necessary details from the state
+    let (input_reserve, output_reserve, output_addr, output_hash, trade_volume_in_erth) = if input_token == &state.token_erth_contract {
         (
             state.token_erth_reserve,
             state.token_b_reserve,
             state.token_b_contract.clone(),
             state.token_b_hash.clone(),
+            input_amount,  // Trade volume is the input amount in ERTH
         )
     } else if input_token == &state.token_b_contract {
         (
@@ -428,74 +443,75 @@ fn calculate_swap(
             state.token_erth_reserve,
             state.token_erth_contract.clone(),
             state.token_erth_hash.clone(),
+            // Convert input token volume to ERTH using reserve ratio
+            (input_amount * state.token_erth_reserve) / state.token_b_reserve,
         )
     } else {
         return Err(StdError::generic_err("Invalid input token"));
     };
 
     // Calculate the output amount using the constant product formula
-    let output_amount = (amount_after_protocol_fee * output_reserve) / (input_reserve + amount_after_protocol_fee);
+    let output_amount = (amount_after_protocol_fee * output_reserve)
+        / (input_reserve + amount_after_protocol_fee);
 
     // Check if the liquidity is enough
     if output_amount > output_reserve {
         return Err(StdError::generic_err("Insufficient liquidity in reserves"));
     }
 
-    // Check against minimum received amount
-    if let Some(min) = min_received {
-        if output_amount < min {
-            return Err(StdError::generic_err("Output amount is less than the minimum received amount"));
-        }
+    // Update the reserves based on the swap
+    if input_token == &state.token_erth_contract {
+        state.token_erth_reserve += amount_after_protocol_fee; // Add input amount to ERTH reserve
+        state.token_b_reserve -= output_amount; // Subtract output amount from token B reserve
+    } else if input_token == &state.token_b_contract {
+        state.token_b_reserve += amount_after_protocol_fee; // Add to token B reserve after protocol fee is deducted
+        state.token_erth_reserve -= output_amount;          // Subtract from ERTH reserve (as we are sending this amount)
+
+        // Perform feeless swap to convert protocol fee to ERTH
+        let protocol_fee_in_erth = calculate_feeless_swap(&state, protocol_fee_amount, &state.token_b_contract)?;
+
+        //update reserves
+        state.token_b_reserve += protocol_fee_amount;
+        state.token_erth_reserve -= protocol_fee_in_erth;
+
+        // The `protocol_fee_amount` now represents the amount in ERTH
+        protocol_fee_amount = protocol_fee_in_erth;
     }
 
-    // Create transfer message if `from` is provided
-    let transfer_msg = if let Some(sender) = from {
-        Some(CosmosMsg::Wasm(WasmMsg::Execute {
-            contract_addr: contract_addr.to_string(),
-            code_hash: code_hash,
-            msg: to_binary(&snip20::HandleMsg::Transfer {
-                recipient: sender.to_string(),
-                amount: output_amount,
-                padding: None,
-                memo: None,
-            })?,
-            funds: vec![],
-        }))
-    } else {
-        None
-    };
-
-    Ok((protocol_fee_amount, output_amount, transfer_msg))
+    // Return the result including the protocol fee (now in ERTH), output amount, and other details
+    Ok((
+        protocol_fee_amount, // Protocol fee in ERTH
+        output_amount,
+        output_addr,
+        output_hash,
+        trade_volume_in_erth,
+    ))
 }
+
+
+
 
 
 
 fn receive_erth_buyback_swap(
     deps: DepsMut,
-    _env: Env,
     info: MessageInfo,
-    from: Addr,
     amount: Uint128,
 ) -> Result<Response, StdError> {
 
     let mut state = STATE.load(deps.storage)?;
     let input_token = info.sender.clone();
 
-
-    // Ensure the call is coming from the buyback contract and input token isn't ERTH
-    if from != state.lp_staking_contract {
-        return Err(StdError::generic_err("Unauthorized: Only the buyback contract can initiate a buyback swap."));
-    }
     if input_token != state.token_b_contract {
         return Err(StdError::generic_err("invalid input token for erth buyback contract"));
     }
 
     // Calculate the swap details without fees
-    let (input_amount, output_amount) = calculate_feeless_swap(&state, amount, &input_token)?;
+    let output_amount = calculate_feeless_swap(&mut state, amount, &input_token)?;
 
-    state.token_b_reserve += input_amount;
+    // Update reserves
+    state.token_b_reserve += amount;
     state.token_erth_reserve -= output_amount;
-
 
     // Save state
     STATE.save(deps.storage, &state)?;
@@ -505,7 +521,11 @@ fn receive_erth_buyback_swap(
         recipient: state.lp_staking_contract.to_string(),
         recipient_code_hash: Some(state.lp_staking_hash.clone()),
         amount: output_amount,
-        msg: Some(to_binary(&SendMessage::BurnErth {})?),
+        msg: Some(to_binary(&SendMessage::BurnErth {
+            trade_volume: output_amount,
+            pool_liquidity: state.token_erth_reserve * Uint128::from(2u32),
+            total_shares: state.total_shares.clone(),
+        })?),
         memo: None,
         padding: None,
     };
@@ -528,29 +548,23 @@ fn receive_erth_buyback_swap(
 // function only used in the ANML-ERTH pair for 1/second ERTH->ANML buyback and burn
 fn receive_anml_buyback_swap(
     deps: DepsMut,
-    _env: Env,
     info: MessageInfo,
-    from: Addr,
     amount: Uint128,
 ) -> Result<Response, StdError> {
 
     let mut state = STATE.load(deps.storage)?;
     let input_token = info.sender.clone();
 
-    // Ensure the call is coming from the buyback contract and input token isn't ERTH
-    if from != state.registration_contract {
-        return Err(StdError::generic_err("Unauthorized: Only the registration contract can initiate a buyback swap."));
-    }
     if input_token != state.token_erth_contract {
         return Err(StdError::generic_err("invalid input token for anml buyback contract"));
     }
 
     // Calculate the swap details without fees
-    let (input_amount, output_amount) = calculate_feeless_swap(&state, amount, &input_token)?;
+    let output_amount = calculate_feeless_swap(&mut state, amount, &input_token)?;
 
-    state.token_erth_reserve += input_amount;
+    // Update reserves
+    state.token_erth_reserve += amount;
     state.token_b_reserve -= output_amount;
-
 
     // Save state
     STATE.save(deps.storage, &state)?;
@@ -560,7 +574,11 @@ fn receive_anml_buyback_swap(
         recipient: state.lp_staking_contract.to_string(),
         recipient_code_hash: Some(state.lp_staking_hash.clone()),
         amount: output_amount,
-        msg: Some(to_binary(&SendMessage::BurnAnml {})?),
+        msg: Some(to_binary(&SendMessage::BurnAnml {
+            trade_volume: amount,
+            pool_liquidity: state.token_erth_reserve * Uint128::from(2u32),
+            total_shares: state.total_shares.clone(),
+        })?),
         memo: None,
         padding: None,
     };
@@ -581,28 +599,34 @@ fn receive_anml_buyback_swap(
 }
 
 fn calculate_feeless_swap(
-    state: &State,
+    state: &State, 
     input_amount: Uint128,
     input_token: &Addr,
-) -> Result<(Uint128, Uint128), StdError> {
-    // Determine the reserves based on the input token
+) -> Result<Uint128, StdError> {
+    // Extract the reserves immutably before mutating state
     let (input_reserve, output_reserve) = if input_token == &state.token_b_contract {
         (state.token_b_reserve, state.token_erth_reserve)
-    } else {
+    } else if input_token == &state.token_erth_contract {
         (state.token_erth_reserve, state.token_b_reserve)
+    } else {
+        return Err(StdError::generic_err("Invalid input token for feeless swap"));
     };
 
     // Calculate the output amount using the constant product formula
-    let output_amount = (input_amount * output_reserve) / (input_reserve + input_amount);
+    let output_amount = (input_amount * output_reserve)
+        / (input_reserve + input_amount);
 
     // Check if there is enough liquidity in the reserves
     if output_amount > output_reserve {
-        return Err(StdError::generic_err("Insufficient liquidity in reserves for buyback swap"));
+        return Err(StdError::generic_err(
+            "Insufficient liquidity in reserves for feeless swap",
+        ));
     }
 
-    // Return the input amount and calculated output amount
-    Ok((input_amount, output_amount))
+    // Return the calculated output amount (which is in ERTH)
+    Ok(output_amount)
 }
+
 
 
 pub fn recieve_unbond_liquidity(
@@ -779,37 +803,48 @@ fn handle_instantiate_lp_token_reply(
 
 
 #[entry_point]
-pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
+pub fn migrate(deps: DepsMut, env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
         MigrateMsg::Migrate {} => {
-            // Load the old state
-            let old_state = OLD_STATE.load(deps.storage)?;
 
-            // Map old state to new state
-            let new_state = State {
-                contract_manager: old_state.contract_manager,
-                token_erth_contract: old_state.token_erth_contract,
-                token_erth_hash: old_state.token_erth_hash,
-                token_b_contract: old_state.token_b_contract,
-                token_b_hash: old_state.token_b_hash,
-                token_b_symbol: old_state.token_b_symbol,
-                registration_contract: old_state.registration_contract,
-                registration_hash: old_state.registration_hash,
-                lp_token_contract: old_state.lp_token_contract,
-                lp_token_hash: old_state.lp_token_hash,
-                lp_token_code_id: old_state.lp_token_code_id,
-                lp_staking_contract: old_state.burn_contract,
-                lp_staking_hash: old_state.burn_hash,
-                token_erth_reserve: old_state.token_erth_reserve,
-                token_b_reserve: old_state.token_b_reserve,
-                total_shares: old_state.total_shares,
-                protocol_fee: old_state.protocol_fee,
-            };
+            // Load the state
+            let state = STATE.load(deps.storage)?;
 
-            // Save the new state
-            STATE.save(deps.storage, &new_state)?;
+            // Register this contract as a receiver for ERTH
+            let register_erth_msg = CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: state.token_erth_contract.to_string(),
+                code_hash: state.token_erth_hash,
+                msg: to_binary(&snip20::HandleMsg::RegisterReceive {
+                    code_hash: env.contract.code_hash.clone(),
+                    padding: None,  // Optional padding
+                })?,
+                funds: vec![],
+            });
+
+            let register_b_msg = CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: state.token_b_contract.to_string(),
+                code_hash: state.token_b_hash,
+                msg: to_binary(&snip20::HandleMsg::RegisterReceive {
+                    code_hash: env.contract.code_hash.clone(),
+                    padding: None,  // Optional padding
+                })?,
+                funds: vec![],
+            });
+
+            let register_lp_msg = CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: state.lp_token_contract.to_string(),
+                code_hash: state.lp_token_hash,
+                msg: to_binary(&snip20::HandleMsg::RegisterReceive {
+                    code_hash: env.contract.code_hash.clone(),
+                    padding: None,  // Optional padding
+                })?,
+                funds: vec![],
+            });
 
             Ok(Response::new()
+                .add_message(register_erth_msg)
+                .add_message(register_b_msg)
+                .add_message(register_lp_msg)
                 .add_attribute("action", "migrate"))
         }
     }
@@ -834,11 +869,11 @@ pub fn query_swap(
     input_token: Addr,
 ) -> StdResult<QuerySwapResponse> {
     // Load state
-    let state = STATE.load(deps.storage)?;
+    let mut state = STATE.load(deps.storage)?;
 
     // Calculate the swap details without creating messages
-    let (protocol_fee_amount, output_amount, _) =
-        calculate_swap(&state, None, input_amount, &input_token, None)?;
+    let (protocol_fee_amount, output_amount, _, _, _) =
+        calculate_swap(&mut state, input_amount, &input_token)?;
 
     Ok(QuerySwapResponse {
         protocol_fee_amount,

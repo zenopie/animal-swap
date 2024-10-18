@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use cosmwasm_std::{Binary, Uint128};
+use cosmwasm_std::{Binary, Uint128, Addr};
 
 use crate::state::State;
 
@@ -51,6 +51,12 @@ pub struct InitConfig {
     pub can_modify_denoms: Option<bool>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+pub struct HopDetails {
+    pub contract: String,
+    pub hash: String,
+}
+
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -77,7 +83,9 @@ pub enum ExecuteMsg {
 pub enum ReceiveMsg {
     UnbondLiquidity {},
     Swap { 
-        min_received: Option<Uint128> 
+        min_received: Option<Uint128>,
+        hop: Option<HopDetails>,
+        user: Option<Addr>,
     },
     ErthBuybackSwap {},
     AnmlBuybackSwap {},
@@ -87,8 +95,20 @@ pub enum ReceiveMsg {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SendMessage {
-    BurnAnml {},
-    BurnErth {},
+    BurnAnml {
+        trade_volume: Uint128,
+        pool_liquidity: Uint128,
+        total_shares: Uint128,
+    },
+    BurnErth {
+        trade_volume: Uint128,
+        pool_liquidity: Uint128,
+        total_shares: Uint128,
+    },
+    Swap { 
+        min_received: Option<Uint128>,
+        user: Addr,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, JsonSchema)]
